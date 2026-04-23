@@ -38,7 +38,8 @@ ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
 # Always upgrade yt-dlp to latest (YouTube bot-detection changes frequently)
-RUN pip install --upgrade --no-cache-dir yt-dlp
+# Also install EJS scripts (yt-dlp-ejs) via the default dependency group.
+RUN pip install --upgrade --no-cache-dir "yt-dlp[default]"
 
 # Copy application code
 COPY . .

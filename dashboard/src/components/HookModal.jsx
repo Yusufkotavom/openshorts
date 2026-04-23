@@ -15,6 +15,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
     const [size, setSize] = useState('M');
     const [entranceAnimation, setEntranceAnimation] = useState('spring');
     const [displayDuration, setDisplayDuration] = useState(5);
+    const [persistToProject, setPersistToProject] = useState(true);
 
     if (!isOpen) return null;
 
@@ -96,6 +97,24 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
                     </h3>
 
                     <div className="space-y-6 flex-1 overflow-y-auto custom-scrollbar pr-2">
+                        {/* Persist toggle (so "Add Hook" survives reload/history) */}
+                        {useRemotionPreview && (
+                            <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg border border-white/5">
+                                <div className="text-xs text-zinc-300">
+                                    Save to project
+                                </div>
+                                <label className="relative inline-flex items-center cursor-pointer">
+                                    <input
+                                        type="checkbox"
+                                        checked={persistToProject}
+                                        onChange={(e) => setPersistToProject(e.target.checked)}
+                                        className="sr-only peer"
+                                    />
+                                    <div className="w-9 h-5 bg-zinc-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-yellow-500"></div>
+                                </label>
+                            </div>
+                        )}
+
                         {/* Text Input */}
                         <div>
                             <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-3 block">Text</label>
@@ -196,6 +215,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
                     <button
                         onClick={() => onGenerate({
                             text, position, size,
+                            persistToProject,
                             // Remotion data
                             remotion: hookConfig,
                         })}

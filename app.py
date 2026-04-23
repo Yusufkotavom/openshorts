@@ -7,8 +7,10 @@ import shutil
 import glob
 import time
 import asyncio
+import signal
 from dotenv import load_dotenv
 from typing import Dict, Optional, List
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,11 +31,179 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
 MAX_FILE_SIZE_MB = 2048  # 2GB limit
-JOB_RETENTION_SECONDS = 3600  # 1 hour retention
+JOB_RETENTION_SECONDS = int(os.environ.get("JOB_RETENTION_SECONDS", "86400"))  # default: 24h retention
+
+# Persisted job metadata/logs (so users can leave/create new jobs without "losing" previous ones)
+JOB_META_FILENAME = "job.json"
+JOB_LOG_FILENAME = "job.log"
+CLIP_LAYERS_FILENAME_TEMPLATE = "clip_{clip_index}_layers.json"
+
+_job_meta_write_lock = threading.Lock()
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _job_dir(job_id: str) -> str:
+    return os.path.join(OUTPUT_DIR, job_id)
+
+def _job_meta_path(job_id: str) -> str:
+    return os.path.join(_job_dir(job_id), JOB_META_FILENAME)
+
+def _job_log_path(job_id: str) -> str:
+    return os.path.join(_job_dir(job_id), JOB_LOG_FILENAME)
+
+def _clip_layers_path(job_id: str, clip_index: int) -> str:
+    return os.path.join(_job_dir(job_id), CLIP_LAYERS_FILENAME_TEMPLATE.format(clip_index=clip_index))
+
+def _write_json_atomic(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+def _load_job_meta(job_id: str) -> Optional[dict]:
+    try:
+        p = _job_meta_path(job_id)
+        if not os.path.exists(p):
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _persist_job_meta(job_id: str, patch: dict) -> None:
+    if job_id in deleted_jobs:
+        return
+    # Serialize updates to avoid concurrent writes from log thread + worker status updates.
+    with _job_meta_write_lock:
+        current = _load_job_meta(job_id) or {"job_id": job_id, "created_at": _now_iso()}
+        current.update(patch)
+        current["updated_at"] = _now_iso()
+        _write_json_atomic(_job_meta_path(job_id), current)
+
+def _append_job_log(job_id: str, line: str) -> None:
+    if job_id in deleted_jobs:
+        return
+    try:
+        os.makedirs(_job_dir(job_id), exist_ok=True)
+        with open(_job_log_path(job_id), "a", encoding="utf-8") as f:
+            f.write(line.rstrip("\n") + "\n")
+    except Exception:
+        pass
+
+def _tail_job_log(job_id: str, max_lines: int = 200) -> List[str]:
+    p = _job_log_path(job_id)
+    if not os.path.exists(p):
+        return []
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        return lines[-max_lines:]
+    except Exception:
+        return []
+
+def _load_job_metadata_json(job_id: str) -> Optional[dict]:
+    """Load the main *_metadata.json for a job directory, if present."""
+    try:
+        output_dir = _job_dir(job_id)
+        json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+        if not json_files:
+            return None
+        with open(json_files[0], "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _load_clip_layers(job_id: str, clip_index: int) -> Optional[dict]:
+    try:
+        p = _clip_layers_path(job_id, clip_index)
+        if not os.path.exists(p):
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _persist_clip_layers(job_id: str, clip_index: int, layers: dict) -> None:
+    # Store the exact Remotion layer configs so history/edit survives reload.
+    payload = {
+        "job_id": job_id,
+        "clip_index": clip_index,
+        "layers": layers,
+        "updated_at": _now_iso(),
+    }
+    _write_json_atomic(_clip_layers_path(job_id, clip_index), payload)
+
+def _compute_result_from_metadata(job_id: str, data: dict) -> Optional[dict]:
+    """Best-effort build of the result payload from metadata.json."""
+    try:
+        meta_files = glob.glob(os.path.join(_job_dir(job_id), "*_metadata.json"))
+        base_name = None
+        if meta_files:
+            base_name = os.path.basename(meta_files[0]).replace("_metadata.json", "")
+        clips = data.get("shorts", []) or []
+        for i, clip in enumerate(clips):
+            # Ensure clip has video_url; fall back to standard naming.
+            if not clip.get("video_url"):
+                if base_name:
+                    clip_filename = f"{base_name}_clip_{i+1}.mp4"
+                else:
+                    clip_filename = f"clip_{i+1}.mp4"
+                clip["video_url"] = f"/videos/{job_id}/{clip_filename}"
+        return {"clips": clips, "cost_analysis": data.get("cost_analysis")}
+    except Exception:
+        return None
+
+def _ensure_job_loaded(job_id: str) -> dict:
+    """
+    Ensure a job is available in memory. If it doesn't exist in RAM (e.g. after refresh/new job),
+    load it from persisted job.json, or backfill from metadata.json.
+    """
+    if job_id in jobs:
+        return jobs[job_id]
+
+    meta = _load_job_meta(job_id)
+    if not meta:
+        data = _load_job_metadata_json(job_id)
+        if data:
+            # Backfill persisted meta for older jobs.
+            _persist_job_meta(job_id, {
+                "status": "completed",
+                "input": {"type": "unknown"},
+                "result": _compute_result_from_metadata(job_id, data),
+            })
+            meta = _load_job_meta(job_id)
+
+    if not meta:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = {
+        "status": meta.get("status", "unknown"),
+        "logs": _tail_job_log(job_id, max_lines=250),
+        "result": meta.get("result"),
+        "cmd": None,
+        "env": None,
+        "output_dir": _job_dir(job_id),
+        "input_file": meta.get("input_file"),
+        "project_id": meta.get("project_id"),
+    }
+
+    # If result is missing but metadata exists, compute it.
+    if not job.get("result"):
+        data = _load_job_metadata_json(job_id)
+        if data:
+            job["result"] = _compute_result_from_metadata(job_id, data)
+            _persist_job_meta(job_id, {"result": job["result"]})
+
+    jobs[job_id] = job
+    return job
 
 # Application State
 job_queue = asyncio.Queue()
 jobs: Dict[str, Dict] = {}
+job_processes: Dict[str, subprocess.Popen] = {}
+deleted_jobs = set()
 thumbnail_sessions: Dict[str, Dict] = {}
 publish_jobs: Dict[str, Dict] = {}  # {publish_id: {status, result, error}}
 # Semester to limit concurrency to MAX_CONCURRENT_JOBS
@@ -147,6 +317,8 @@ async def process_queue():
 async def run_job_wrapper(job_id):
     """Wrapper to run job and release semaphore"""
     try:
+        if job_id in deleted_jobs:
+            return
         job = jobs.get(job_id)
         if job:
             await run_job(job_id, job)
@@ -187,6 +359,7 @@ app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails
 
 class ProcessRequest(BaseModel):
     url: str
+    options: Optional[dict] = None
 
 def enqueue_output(out, job_id):
     """Reads output from a subprocess and appends it to jobs logs."""
@@ -195,6 +368,7 @@ def enqueue_output(out, job_id):
             decoded_line = line.decode('utf-8').strip()
             if decoded_line:
                 print(f"📝 [Job Output] {decoded_line}")
+                _append_job_log(job_id, decoded_line)
                 if job_id in jobs:
                     jobs[job_id]['logs'].append(decoded_line)
     except Exception as e:
@@ -204,6 +378,8 @@ def enqueue_output(out, job_id):
 
 async def run_job(job_id, job_data):
     """Executes the subprocess for a specific job."""
+    if job_id in deleted_jobs:
+        return
     
     cmd = job_data['cmd']
     env = job_data['env']
@@ -211,6 +387,7 @@ async def run_job(job_id, job_data):
     
     jobs[job_id]['status'] = 'processing'
     jobs[job_id]['logs'].append("Job started by worker.")
+    _persist_job_meta(job_id, {"status": "processing", "started_at": _now_iso()})
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
     
     try:
@@ -219,8 +396,12 @@ async def run_job(job_id, job_data):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, # Merge stderr to stdout
             env=env,
-            cwd=os.getcwd()
+            cwd=os.getcwd(),
+            start_new_session=True,
         )
+        job_processes[job_id] = process
+        jobs[job_id]['pid'] = process.pid
+        _persist_job_meta(job_id, {"pid": process.pid})
         
         # We need to capture logs in a thread because Popen isn't async
         t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
@@ -267,10 +448,13 @@ async def run_job(job_id, job_data):
                 pass
 
         returncode = process.returncode
+        if job_id in deleted_jobs:
+            return
         
         if returncode == 0:
             jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
+            _persist_job_meta(job_id, {"status": "completed", "completed_at": _now_iso(), "exit_code": 0})
             
             # Start S3 upload in background (silent, non-blocking)
             loop = asyncio.get_event_loop()
@@ -297,22 +481,162 @@ async def run_job(job_id, job_data):
                      clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
                 
                 jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
+                _persist_job_meta(job_id, {"result": jobs[job_id]['result']})
+                # Optional post-processing (server-side) so results survive reload/history.
+                try:
+                    opts = (job_data or {}).get("options") or {}
+                    if opts.get("auto_subtitle") or opts.get("auto_hook"):
+                        jobs[job_id]['status'] = 'processing'
+                        jobs[job_id]['logs'].append("Starting post-processing...")
+                        _persist_job_meta(job_id, {"status": "processing", "postprocess_started_at": _now_iso()})
+
+                        # Import pydantic request models + handlers lazily to avoid circular import issues.
+                        # These endpoints already update metadata/job.json.
+                        for clip_index in range(len(clips)):
+                            if opts.get("auto_subtitle"):
+                                try:
+                                    req = SubtitleRequest(
+                                        job_id=job_id,
+                                        clip_index=clip_index,
+                                        position=opts.get("subtitle_position", "bottom"),
+                                        font_size=int(opts.get("subtitle_font_size", 16)),
+                                        font_name=opts.get("subtitle_font_name", "Verdana"),
+                                        font_color=opts.get("subtitle_font_color", "#FFFFFF"),
+                                        border_color=opts.get("subtitle_border_color", "#000000"),
+                                        border_width=int(opts.get("subtitle_border_width", 2)),
+                                        bg_color=opts.get("subtitle_bg_color", "#000000"),
+                                        bg_opacity=float(opts.get("subtitle_bg_opacity", 0.0)),
+                                    )
+                                    await add_subtitles(req)
+                                except Exception as e:
+                                    jobs[job_id]['logs'].append(f"Postprocess subtitle failed (clip {clip_index}): {e}")
+
+                            if opts.get("auto_hook"):
+                                try:
+                                    hook_text = (opts.get("hook_text") or "").strip() or "POV: ini clip terbaiknya"
+                                    req = HookRequest(
+                                        job_id=job_id,
+                                        clip_index=clip_index,
+                                        text=hook_text,
+                                        position=opts.get("hook_position", "top"),
+                                        size=opts.get("hook_size", "M"),
+                                    )
+                                    await add_hook(req)
+                                except Exception as e:
+                                    jobs[job_id]['logs'].append(f"Postprocess hook failed (clip {clip_index}): {e}")
+
+                        # Refresh in-memory result from disk (job.json) in case endpoints updated it
+                        try:
+                            reloaded = _ensure_job_loaded(job_id)
+                            if reloaded.get("result"):
+                                jobs[job_id]['result'] = reloaded["result"]
+                                _persist_job_meta(job_id, {"result": jobs[job_id]['result']})
+                        except Exception:
+                            pass
+
+                        jobs[job_id]['status'] = 'completed'
+                        jobs[job_id]['logs'].append("Post-processing completed.")
+                        _persist_job_meta(job_id, {"status": "completed", "postprocess_completed_at": _now_iso()})
+                except Exception as e:
+                    jobs[job_id]['logs'].append(f"Post-processing error: {e}")
             else:
                  jobs[job_id]['status'] = 'failed'
                  jobs[job_id]['logs'].append("No metadata file generated.")
+                 _persist_job_meta(job_id, {"status": "failed", "completed_at": _now_iso(), "exit_code": 0, "error": "No metadata file generated"})
         else:
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['logs'].append(f"Process failed with exit code {returncode}")
+            _persist_job_meta(job_id, {"status": "failed", "completed_at": _now_iso(), "exit_code": int(returncode)})
             
     except Exception as e:
+        if job_id in deleted_jobs:
+            return
         jobs[job_id]['status'] = 'failed'
         jobs[job_id]['logs'].append(f"Execution error: {str(e)}")
+        _persist_job_meta(job_id, {"status": "failed", "completed_at": _now_iso(), "error": str(e)})
+    finally:
+        job_processes.pop(job_id, None)
+
+def _delete_upload_for_job(job_id: str, meta: Optional[dict], job_data: Optional[dict]) -> None:
+    candidates = []
+    if meta and meta.get("input_file"):
+        candidates.append(meta["input_file"])
+    if job_data and job_data.get("input_file"):
+        candidates.append(job_data["input_file"])
+
+    for path in candidates:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    try:
+        for filename in os.listdir(UPLOAD_DIR):
+            if filename.startswith(f"{job_id}_"):
+                try:
+                    os.remove(os.path.join(UPLOAD_DIR, filename))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+def _kill_job_process(job_id: str) -> None:
+    process = job_processes.get(job_id)
+    if not process or process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+def _delete_single_job(job_id: str) -> dict:
+    meta = _load_job_meta(job_id) or {"job_id": job_id}
+    job_data = jobs.get(job_id) or {}
+    deleted_jobs.add(job_id)
+
+    _kill_job_process(job_id)
+    _delete_upload_for_job(job_id, meta, job_data)
+
+    jobs.pop(job_id, None)
+    job_processes.pop(job_id, None)
+
+    output_dir = _job_dir(job_id)
+    if os.path.isdir(output_dir):
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+    return {"job_id": job_id, "deleted": True}
+
+def _find_job_ids_by_project(project_id: str) -> List[str]:
+    job_ids: List[str] = []
+    try:
+        for name in os.listdir(OUTPUT_DIR):
+            job_path = os.path.join(OUTPUT_DIR, name)
+            if not os.path.isdir(job_path):
+                continue
+            try:
+                uuid.UUID(name)
+            except Exception:
+                continue
+            meta = _load_job_meta(name)
+            if meta and meta.get("project_id") == project_id:
+                job_ids.append(name)
+    except Exception:
+        pass
+    return job_ids
 
 @app.post("/api/process")
 async def process_endpoint(
     request: Request,
     file: Optional[UploadFile] = File(None),
-    url: Optional[str] = Form(None)
+    url: Optional[str] = Form(None),
+    options_json: Optional[str] = Form(None),
+    project_id: Optional[str] = Form(None),
 ):
     api_key = request.headers.get("X-Gemini-Key")
     if not api_key:
@@ -320,9 +644,19 @@ async def process_endpoint(
     
     # Handle JSON body manually for URL payload
     content_type = request.headers.get("content-type", "")
+    options: dict = {}
     if "application/json" in content_type:
         body = await request.json()
         url = body.get("url")
+        project_id = body.get("project_id") or body.get("projectId")
+        options = body.get("options") or {}
+    else:
+        # Multipart/form-data path
+        if options_json:
+            try:
+                options = json.loads(options_json)
+            except Exception:
+                options = {}
     
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
@@ -330,6 +664,19 @@ async def process_endpoint(
     job_id = str(uuid.uuid4())
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
     os.makedirs(job_output_dir, exist_ok=True)
+
+    # Persist initial job metadata so it survives page refresh / starting a new job
+    _persist_job_meta(job_id, {
+        "status": "queued",
+        "project_id": project_id,
+        "options": options,
+        "input": {
+            "type": "url" if url else "file",
+            "url": url,
+            "filename": getattr(file, "filename", None),
+        },
+        "input_file": None,
+    })
     
     # Prepare Command
     cmd = ["python", "-u", "main.py"] # -u for unbuffered
@@ -338,6 +685,7 @@ async def process_endpoint(
     
     if url:
         cmd.extend(["-u", url])
+        input_file = None
     else:
         # Save uploaded file with size limit check
         input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
@@ -356,8 +704,11 @@ async def process_endpoint(
                 buffer.write(content)
                 
         cmd.extend(["-i", input_path])
+        input_file = input_path
 
     cmd.extend(["-o", job_output_dir])
+
+    _persist_job_meta(job_id, {"input_file": input_file})
 
     # Enqueue Job
     jobs[job_id] = {
@@ -365,24 +716,138 @@ async def process_endpoint(
         'logs': [f"Job {job_id} queued."],
         'cmd': cmd,
         'env': env,
-        'output_dir': job_output_dir
+        'output_dir': job_output_dir,
+        'options': options,
+        'input_file': input_file,
+        'project_id': project_id,
     }
     
     await job_queue.put(job_id)
     
     return {"job_id": job_id, "status": "queued"}
 
+@app.get("/api/jobs")
+async def list_jobs(limit: int = 50, project_id: Optional[str] = None):
+    """
+    List recent jobs from disk (durable across refresh/restart).
+    """
+    items: List[dict] = []
+    try:
+        for name in os.listdir(OUTPUT_DIR):
+            job_path = os.path.join(OUTPUT_DIR, name)
+            if not os.path.isdir(job_path):
+                continue
+            # Ignore non-job folders (thumbnails, actor galleries, etc.)
+            try:
+                uuid.UUID(name)
+            except Exception:
+                continue
+            meta_path = os.path.join(job_path, JOB_META_FILENAME)
+            if not os.path.exists(meta_path):
+                # Backfill for older jobs: if metadata exists, synthesize a durable job.json.
+                meta_files = glob.glob(os.path.join(job_path, "*_metadata.json"))
+                if meta_files:
+                    created_at = datetime.fromtimestamp(os.path.getmtime(job_path), tz=timezone.utc).isoformat()
+                    # Best-effort result extraction (clips + cost_analysis) so UI can open it.
+                    result = None
+                    try:
+                        with open(meta_files[0], "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        base_name = os.path.basename(meta_files[0]).replace("_metadata.json", "")
+                        clips = data.get("shorts", [])
+                        for i, clip in enumerate(clips):
+                            clip_filename = f"{base_name}_clip_{i+1}.mp4"
+                            clip["video_url"] = f"/videos/{name}/{clip_filename}"
+                        result = {"clips": clips, "cost_analysis": data.get("cost_analysis")}
+                    except Exception:
+                        pass
+                    _persist_job_meta(name, {
+                        "created_at": created_at,
+                        "status": "completed",
+                        "input": {"type": "unknown"},
+                        "result": result,
+                    })
+                else:
+                    continue
+
+            meta = _load_job_meta(name)
+            if not meta:
+                continue
+            if project_id and meta.get("project_id") != project_id:
+                continue
+            items.append({
+                "job_id": meta.get("job_id", name),
+                "status": meta.get("status", "unknown"),
+                "created_at": meta.get("created_at"),
+                "updated_at": meta.get("updated_at"),
+                "project_id": meta.get("project_id"),
+                "input": meta.get("input"),
+                "result": meta.get("result"),
+            })
+    except Exception:
+        pass
+
+    def _sort_key(x: dict):
+        return (x.get("created_at") or "", x.get("updated_at") or "")
+
+    items.sort(key=_sort_key, reverse=True)
+    return {"jobs": items[: max(1, min(int(limit), 500))]}
+
 @app.get("/api/status/{job_id}")
 async def get_status(job_id: str):
-    if job_id not in jobs:
+    if job_id in jobs:
+        job = jobs[job_id]
+        return {
+            "status": job['status'],
+            "logs": job['logs'],
+            "result": job.get('result')
+        }
+
+    # Fallback to persisted job meta/logs on disk
+    meta = _load_job_meta(job_id)
+    if not meta:
         raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[job_id]
+
     return {
-        "status": job['status'],
-        "logs": job['logs'],
-        "result": job.get('result')
+        "status": meta.get("status", "unknown"),
+        "logs": _tail_job_log(job_id, max_lines=250),
+        "result": meta.get("result"),
+        "error": meta.get("error"),
+        "input": meta.get("input"),
+        "created_at": meta.get("created_at"),
+        "updated_at": meta.get("updated_at"),
+        "project_id": meta.get("project_id"),
     }
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: str):
+    meta = _load_job_meta(job_id)
+    if not meta and job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _delete_single_job(job_id)
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str):
+    if not project_id:
+        raise HTTPException(status_code=400, detail="Missing project_id")
+
+    job_ids = _find_job_ids_by_project(project_id)
+    for job_id, job in list(jobs.items()):
+        if job.get("project_id") == project_id and job_id not in job_ids:
+            job_ids.append(job_id)
+
+    if not job_ids:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    deleted = []
+    for job_id in job_ids:
+        try:
+            _delete_single_job(job_id)
+            deleted.append(job_id)
+        except Exception:
+            pass
+
+    return {"project_id": project_id, "deleted_job_ids": deleted, "deleted_count": len(deleted)}
 
 from editor import VideoEditor
 from subtitles import generate_srt, burn_subtitles, generate_srt_from_video
@@ -407,10 +872,7 @@ async def edit_clip(
     if not final_api_key:
         raise HTTPException(status_code=400, detail="Missing Gemini API Key (Header or Body)")
 
-    if req.job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[req.job_id]
+    job = _ensure_job_loaded(req.job_id)
     if 'result' not in job or 'clips' not in job['result']:
         raise HTTPException(status_code=400, detail="Job result not available")
         
@@ -505,9 +967,28 @@ async def edit_clip(
         
         new_video_url = f"/videos/{req.job_id}/{edited_filename}"
         
-        # Start a new "edited" clip entry or just update the current one?
-        # Let's update the current one's video_url but keep backup?
-        # Or return the new URL to the frontend to display.
+        # Persist: update in-memory result + job.json + metadata.json so reload doesn't lose the edit.
+        try:
+            if job.get("result") and job["result"].get("clips") and req.clip_index < len(job["result"]["clips"]):
+                job["result"]["clips"][req.clip_index]["video_url"] = new_video_url
+                _persist_job_meta(req.job_id, {"result": job["result"]})
+        except Exception:
+            pass
+
+        try:
+            output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+            meta_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+            if meta_files:
+                with open(meta_files[0], "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                clips = data.get("shorts", []) or []
+                if req.clip_index < len(clips):
+                    clips[req.clip_index]["video_url"] = new_video_url
+                    data["shorts"] = clips
+                    with open(meta_files[0], "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=4, ensure_ascii=False)
+        except Exception:
+            pass
         
         return {
             "success": True, 
@@ -536,8 +1017,7 @@ class SubtitleRequest(BaseModel):
 @app.get("/api/clip/{job_id}/{clip_index}/transcript")
 async def get_clip_transcript(job_id: str, clip_index: int):
     """Return word-level captions for a specific clip, formatted for Remotion."""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
+    _ensure_job_loaded(job_id)
 
     output_dir = os.path.join(OUTPUT_DIR, job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
@@ -579,6 +1059,97 @@ async def get_clip_transcript(job_id: str, clip_index: int):
         "language": transcript.get('language', 'en'),
     }
 
+class ClipLayersRequest(BaseModel):
+    layers: dict
+
+@app.get("/api/clip/{job_id}/{clip_index}/layers")
+async def get_clip_layers(job_id: str, clip_index: int):
+    _ensure_job_loaded(job_id)
+    saved = _load_clip_layers(job_id, clip_index)
+    return {"layers": (saved or {}).get("layers")}
+
+@app.post("/api/clip/{job_id}/{clip_index}/layers")
+async def save_clip_layers(job_id: str, clip_index: int, req: ClipLayersRequest):
+    _ensure_job_loaded(job_id)
+    if not isinstance(req.layers, dict):
+        raise HTTPException(status_code=400, detail="Invalid layers payload")
+    _persist_clip_layers(job_id, clip_index, req.layers)
+    return {"success": True}
+
+@app.post("/api/clip/{job_id}/{clip_index}/save-render")
+async def save_rendered_clip_video(
+    job_id: str,
+    clip_index: int,
+    file: UploadFile = File(...),
+    kind: str = Form("remotion"),
+    layers_json: Optional[str] = Form(None),
+):
+    """
+    Persist a browser-rendered (Remotion/WebCodecs) MP4 into the job folder so it survives reload/history.
+    Also optionally persists the Remotion layer configs for future editing.
+    """
+    job = _ensure_job_loaded(job_id)
+    output_dir = _job_dir(job_id)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Sanitize kind for filename safety
+    safe_kind = "".join(ch for ch in (kind or "") if ch.isalnum() or ch in ("_", "-")).strip("_-") or "render"
+    ext = os.path.splitext(getattr(file, "filename", "") or "")[1].lower() or ".mp4"
+    if ext not in (".mp4", ".mov", ".m4v"):
+        # Still allow, but force mp4 extension to match player expectations.
+        ext = ".mp4"
+
+    ts = int(time.time())
+    out_name = f"{safe_kind}_clip_{clip_index+1}_{ts}{ext}"
+    out_path = os.path.join(output_dir, out_name)
+
+    try:
+        with open(out_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded video: {e}")
+
+    # Persist layers if provided
+    if layers_json:
+        try:
+            layers = json.loads(layers_json)
+            if isinstance(layers, dict):
+                _persist_clip_layers(job_id, clip_index, layers)
+        except Exception:
+            # Don't fail the save-render if layers are invalid
+            pass
+
+    new_video_url = f"/videos/{job_id}/{out_name}"
+
+    # Update *_metadata.json (disk persistence)
+    meta_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if meta_files:
+        meta_path = meta_files[0]
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            clips = data.get("shorts", []) or []
+            if 0 <= clip_index < len(clips):
+                clips[clip_index]["video_url"] = new_video_url
+                data["shorts"] = clips
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=4, ensure_ascii=False)
+        except Exception:
+            pass
+
+    # Update durable job.json + in-memory job result
+    try:
+        result = (job.get("result") or {}).copy() if isinstance(job.get("result"), dict) else {}
+        clips = list((result.get("clips") or [])) if isinstance(result.get("clips"), list) else []
+        if 0 <= clip_index < len(clips):
+            clips[clip_index] = {**clips[clip_index], "video_url": new_video_url}
+        result["clips"] = clips
+        job["result"] = result
+        _persist_job_meta(job_id, {"result": result})
+    except Exception:
+        pass
+
+    return {"success": True, "new_video_url": new_video_url}
 
 # --- Remotion Render Proxy ---
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://renderer:3100")
@@ -623,10 +1194,7 @@ async def generate_effects_config(
     if not final_api_key:
         raise HTTPException(status_code=400, detail="Missing Gemini API Key (Header)")
 
-    if req.job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    job = jobs[req.job_id]
+    job = _ensure_job_loaded(req.job_id)
     if 'result' not in job or 'clips' not in job['result']:
         raise HTTPException(status_code=400, detail="Job result not available")
 
@@ -719,11 +1287,8 @@ async def generate_effects_config(
 
 @app.post("/api/subtitle")
 async def add_subtitles(req: SubtitleRequest):
-    if req.job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    # Reload job data from disk just in case metadata was updated
-    job = jobs[req.job_id]
+    # Reload job data from disk if needed (durable)
+    job = _ensure_job_loaded(req.job_id)
     
     # We need to access metadata.json to get the transcript
     output_dir = os.path.join(OUTPUT_DIR, req.job_id)
@@ -806,9 +1371,10 @@ async def add_subtitles(req: SubtitleRequest):
         raise HTTPException(status_code=500, detail=str(e))
         
     # 3. Update Result and Metadata
-    # Update InMemory Jobs
-    if req.clip_index < len(job['result']['clips']):
-         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+    # Update InMemory Jobs (if result is present)
+    if job.get("result") and job["result"].get("clips") and req.clip_index < len(job["result"]["clips"]):
+        job["result"]["clips"][req.clip_index]["video_url"] = f"/videos/{req.job_id}/{output_filename}"
+        _persist_job_meta(req.job_id, {"result": job["result"]})
     
     # Update Metadata on Disk (Persistence)
     try:
@@ -840,10 +1406,7 @@ class HookRequest(BaseModel):
 
 @app.post("/api/hook")
 async def add_hook(req: HookRequest):
-    if req.job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[req.job_id]
+    job = _ensure_job_loaded(req.job_id)
     output_dir = os.path.join(OUTPUT_DIR, req.job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     
@@ -893,9 +1456,10 @@ async def add_hook(req: HookRequest):
         raise HTTPException(status_code=500, detail=str(e))
         
     # Update Persistence (Same logic as subtitles)
-    # Update InMemory Jobs
-    if req.clip_index < len(job['result']['clips']):
-         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+    # Update InMemory Jobs (if result is present)
+    if job.get("result") and job["result"].get("clips") and req.clip_index < len(job["result"]["clips"]):
+        job["result"]["clips"][req.clip_index]["video_url"] = f"/videos/{req.job_id}/{output_filename}"
+        _persist_job_meta(req.job_id, {"result": job["result"]})
     
     # Update Metadata on Disk
     try:
@@ -934,10 +1498,7 @@ async def translate_clip(
     if not x_elevenlabs_key:
         raise HTTPException(status_code=400, detail="Missing X-ElevenLabs-Key header")
 
-    if req.job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    job = jobs[req.job_id]
+    job = _ensure_job_loaded(req.job_id)
     output_dir = os.path.join(OUTPUT_DIR, req.job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
 
@@ -989,9 +1550,10 @@ async def translate_clip(
         print(f"❌ Translation Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Update InMemory Jobs
-    if req.clip_index < len(job['result']['clips']):
-         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+    # Update InMemory Jobs (if result is present)
+    if job.get("result") and job["result"].get("clips") and req.clip_index < len(job["result"]["clips"]):
+        job["result"]["clips"][req.clip_index]["video_url"] = f"/videos/{req.job_id}/{output_filename}"
+        _persist_job_meta(req.job_id, {"result": job["result"]})
 
     # Update Metadata on Disk
     try:
@@ -1025,10 +1587,7 @@ import httpx
 
 @app.post("/api/social/post")
 async def post_to_socials(req: SocialPostRequest):
-    if req.job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    job = jobs[req.job_id]
+    job = _ensure_job_loaded(req.job_id)
     if 'result' not in job or 'clips' not in job['result']:
         raise HTTPException(status_code=400, detail="Job result not available")
         

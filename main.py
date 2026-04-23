@@ -458,33 +458,41 @@ def download_youtube_video(url, output_dir="."):
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
 
-    cookies_path = '/app/cookies.txt'
+    # Cookies handling:
+    # - Preferred: mount a Netscape-format cookie file to /app/cookies.txt.
+    #   We copy it to /tmp because yt-dlp may try to update/save cookies back to cookiefile.
+    # - Alternative: set YOUTUBE_COOKIES env var (contents will be written into /tmp/yt_cookies.txt).
+    import shutil
+    cookies_src_path = '/app/cookies.txt'
+    cookies_path = '/tmp/yt_cookies.txt'
     cookies_env = os.environ.get("YOUTUBE_COOKIES")
-    if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, creating cookies file inside container...")
-        try:
+
+    try:
+        if cookies_env:
+            print("🍪 Found YOUTUBE_COOKIES env var, writing cookies file into /tmp ...")
             with open(cookies_path, 'w') as f:
                 f.write(cookies_env)
-            if os.path.exists(cookies_path):
-                 print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
-                 with open(cookies_path, 'r') as f:
-                     content = f.read(100)
-                     print(f"   Debug: First 100 chars of cookie file: {content}")
-        except Exception as e:
-            print(f"⚠️ Failed to write cookies file: {e}")
+        elif os.path.exists(cookies_src_path) and os.path.getsize(cookies_src_path) > 0:
+            shutil.copyfile(cookies_src_path, cookies_path)
+
+        if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
+            print(f"🍪 Using cookies file at {cookies_path} ({os.path.getsize(cookies_path)} bytes)")
+        else:
             cookies_path = None
-    else:
+            print("⚠️ No cookies file found (or file is empty). Continuing without cookies.")
+    except Exception as e:
+        print(f"⚠️ Failed to prepare cookies file: {e}")
         cookies_path = None
-        print("⚠️ YOUTUBE_COOKIES env var not found.")
     
     # Common yt-dlp options to work around YouTube bot detection.
     # extractor_args tries multiple player clients in order; tv_embed / android
     # avoid the OAuth/PO-token checks that block server IPs.
+    data_sync_id = os.environ.get("YOUTUBE_DATA_SYNC_ID")
+
     _COMMON_YDL_OPTS = {
         'quiet': False,
         'verbose': True,
         'no_warnings': False,
-        'cookiefile': cookies_path if cookies_path else None,
         'socket_timeout': 30,
         'retries': 10,
         'fragment_retries': 10,
@@ -492,10 +500,14 @@ def download_youtube_video(url, output_dir="."):
         'cachedir': False,
         'extractor_args': {
             'youtube': {
-                'player_client': ['tv_embed', 'android', 'mweb', 'web'],
+                # Prefer cookie-capable clients; web_safari currently provides HLS formats
+                # that are less likely to require PO tokens compared to mweb/web.
+                'player_client': ['web_safari', 'web'],
                 'player_skip': ['webpage', 'configs'],
             }
         },
+        # Force EJS to use node runtime (container includes node).
+        'js_runtimes': {'node': {}},
         'http_headers': {
             'User-Agent': (
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -504,6 +516,10 @@ def download_youtube_video(url, output_dir="."):
             ),
         },
     }
+    if data_sync_id:
+        _COMMON_YDL_OPTS['extractor_args']['youtube']['data_sync_id'] = [data_sync_id]
+    if cookies_path:
+        _COMMON_YDL_OPTS['cookiefile'] = cookies_path
 
     with yt_dlp.YoutubeDL(_COMMON_YDL_OPTS) as ydl:
         try:
@@ -556,7 +572,8 @@ Technical Details: {str(e)}
     
     ydl_opts = {
         **_COMMON_YDL_OPTS,
-        'format': 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]/best',
+        # Avoid over-restricting codecs; re-encode later if needed.
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_template,
         'merge_output_format': 'mp4',
         'overwrites': True,

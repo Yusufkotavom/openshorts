@@ -1,0 +1,113 @@
+<h2>OpenShorts: Batch/Queue + Template Library</h2>
+<p class="subtitle">Pilih arah UX yang paling “powerful” untuk kerja harian. Klik untuk select.</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Queue-First (Recommended)</h3>
+      <p>Home = antrian kerja. Semua job punya status, retry, cancel, dan output tersimpan per job.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Template-First</h3>
+      <p>Home = pilih template dulu, lalu masuk wizard (source → options → run). Cocok buat onboarding.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Workspace Tabs</h3>
+      <p>Top tabs: Templates | Jobs | Library. Lebih “app-like”, sedikit lebih banyak navigasi.</p>
+    </div>
+  </div>
+</div>
+
+<h3 style="margin-top:22px">Template Library Scope</h3>
+<p class="subtitle">Pilih set template awal. Multi-select.</p>
+
+<div class="options" data-multiselect>
+  <div class="option" data-choice="t1" onclick="toggleSelect(this)">
+    <div class="letter">T1</div>
+    <div class="content">
+      <h3>Clip Generator</h3>
+      <p>YouTube/Upload → detect clips → output. (Yang ada sekarang)</p>
+    </div>
+  </div>
+  <div class="option" data-choice="t2" onclick="toggleSelect(this)">
+    <div class="letter">T2</div>
+    <div class="content">
+      <h3>Clip + Auto Subtitles</h3>
+      <p>Default burn subtitles server-side untuk semua clip hasil detect.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="t3" onclick="toggleSelect(this)">
+    <div class="letter">T3</div>
+    <div class="content">
+      <h3>Clip + Viral Hook</h3>
+      <p>Default hook overlay (server-side) atau Remotion (opsional) per clip.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="t4" onclick="toggleSelect(this)">
+    <div class="letter">T4</div>
+    <div class="content">
+      <h3>Batch Variations</h3>
+      <p>Generate 3–10 variasi hook/caption style untuk A/B test.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="t5" onclick="toggleSelect(this)">
+    <div class="letter">T5</div>
+    <div class="content">
+      <h3>Translate + Subtitle</h3>
+      <p>Dub/translate ke bahasa target + subtitles dari audio hasil dubbing.</p>
+    </div>
+  </div>
+</div>
+
+<div class="mockup" style="margin-top:22px">
+  <div class="mockup-header">Preview Concept (Queue-First)</div>
+  <div class="mockup-body">
+    <div style="display:grid;grid-template-columns:1fr;gap:10px">
+      <div style="display:flex;gap:10px;align-items:center;justify-content:space-between">
+        <div>
+          <div style="font-weight:700">Jobs</div>
+          <div style="color:var(--muted);font-size:12px">Queue per project • retry/cancel • saved outputs</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <div style="padding:6px 10px;border:1px solid var(--border);border-radius:8px;font-size:12px;color:var(--muted)">Template: Clip + Subtitles</div>
+          <div style="padding:6px 10px;border:1px solid var(--border);border-radius:8px;font-size:12px;color:var(--muted)">New Job</div>
+        </div>
+      </div>
+
+      <div style="border:1px solid var(--border);border-radius:10px;padding:12px;background:rgba(255,255,255,0.02)">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
+          <div style="display:flex;flex-direction:column;gap:4px">
+            <div style="font-weight:700">Job #35041caf…</div>
+            <div style="font-size:12px;color:var(--muted)">Clip generator • 5 clips • Auto subtitle: ON • Auto hook: OFF</div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <div style="font-size:12px;color:#8bfa9c">Completed</div>
+            <div style="padding:6px 10px;border:1px solid var(--border);border-radius:8px;font-size:12px;color:var(--muted)">Open</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="border:1px solid var(--border);border-radius:10px;padding:12px;background:rgba(255,255,255,0.02)">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
+          <div style="display:flex;flex-direction:column;gap:4px">
+            <div style="font-weight:700">Job #new…</div>
+            <div style="font-size:12px;color:var(--muted)">Batch variations • 10 renders • Queue position: 2</div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <div style="font-size:12px;color:#ffd37a">Processing</div>
+            <div style="padding:6px 10px;border:1px solid var(--border);border-radius:8px;font-size:12px;color:var(--muted)">Cancel</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+

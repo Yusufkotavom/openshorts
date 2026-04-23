@@ -48,6 +48,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, isProcessin
     const [durationSec, setDurationSec] = useState(30);
     const [captionsLoading, setCaptionsLoading] = useState(false);
     const [useRemotionPreview, setUseRemotionPreview] = useState(false);
+    const [persistToProject, setPersistToProject] = useState(true);
 
     // Fetch word-level captions when modal opens
     useEffect(() => {
@@ -188,6 +189,24 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, isProcessin
                     </h3>
 
                     <div className="space-y-5 flex-1 overflow-y-auto custom-scrollbar pr-1">
+                        {/* Persist toggle (so "Generate" actually survives reload/history) */}
+                        {useRemotionPreview && (
+                            <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg border border-white/5">
+                                <div className="text-xs text-zinc-300">
+                                    Save to project
+                                </div>
+                                <label className="relative inline-flex items-center cursor-pointer">
+                                    <input
+                                        type="checkbox"
+                                        checked={persistToProject}
+                                        onChange={(e) => setPersistToProject(e.target.checked)}
+                                        className="sr-only peer"
+                                    />
+                                    <div className="w-9 h-5 bg-zinc-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                                </label>
+                            </div>
+                        )}
+
                         {/* Position Selector */}
                         <div>
                             <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Position</label>
@@ -357,6 +376,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, isProcessin
                     <button
                         onClick={() => onGenerate({
                             position, fontSize, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity,
+                            persistToProject,
                             // Remotion data
                             remotion: useRemotionPreview ? subtitleConfig : null,
                         })}

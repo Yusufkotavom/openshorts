@@ -1,17 +1,27 @@
 import React, { useState } from 'react';
-import { Youtube, Upload, FileVideo, X } from 'lucide-react';
+import { Youtube, Upload, FileVideo, X, Sparkles, Type } from 'lucide-react';
 
 export default function MediaInput({ onProcess, isProcessing }) {
     const [mode, setMode] = useState('url'); // 'url' | 'file'
     const [url, setUrl] = useState('');
     const [file, setFile] = useState(null);
 
+    // Automation defaults (server-side post-processing)
+    const [autoSubtitle, setAutoSubtitle] = useState(false);
+    const [autoHook, setAutoHook] = useState(false);
+    const [hookText, setHookText] = useState('POV: kamu nemu clip paling lucu di video ini');
+
     const handleSubmit = (e) => {
         e.preventDefault();
+        const options = {
+            auto_subtitle: autoSubtitle,
+            auto_hook: autoHook,
+            hook_text: hookText,
+        };
         if (mode === 'url' && url) {
-            onProcess({ type: 'url', payload: url });
+            onProcess({ type: 'url', payload: url, options });
         } else if (mode === 'file' && file) {
-            onProcess({ type: 'file', payload: file });
+            onProcess({ type: 'file', payload: file, options });
         }
     };
 
@@ -94,6 +104,50 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         )}
                     </div>
                 )}
+
+                {/* Automation (Server-Side) */}
+                <div className="mt-6 p-4 rounded-xl border border-white/10 bg-white/5">
+                    <div className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-3">Automation</div>
+
+                    <label className="flex items-center justify-between gap-3 py-2">
+                        <span className="text-sm text-zinc-200 flex items-center gap-2">
+                            <Type size={16} className="text-zinc-400" />
+                            Auto Subtitle (burn in)
+                        </span>
+                        <input
+                            type="checkbox"
+                            checked={autoSubtitle}
+                            onChange={(e) => setAutoSubtitle(e.target.checked)}
+                            className="h-4 w-4 accent-primary"
+                        />
+                    </label>
+
+                    <label className="flex items-center justify-between gap-3 py-2">
+                        <span className="text-sm text-zinc-200 flex items-center gap-2">
+                            <Sparkles size={16} className="text-zinc-400" />
+                            Auto Hook (overlay)
+                        </span>
+                        <input
+                            type="checkbox"
+                            checked={autoHook}
+                            onChange={(e) => setAutoHook(e.target.checked)}
+                            className="h-4 w-4 accent-primary"
+                        />
+                    </label>
+
+                    {autoHook && (
+                        <div className="mt-3 space-y-2">
+                            <div className="text-xs text-zinc-500">Hook text</div>
+                            <textarea
+                                value={hookText}
+                                onChange={(e) => setHookText(e.target.value)}
+                                rows={2}
+                                className="w-full bg-black/40 border border-white/10 rounded-xl p-3 text-white placeholder-zinc-600 focus:outline-none focus:border-primary/50 resize-none"
+                                placeholder="POV: ..."
+                            />
+                        </div>
+                    )}
+                </div>
 
                 <button
                     type="submit"

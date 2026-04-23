@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar } from 'lucide-react';
+import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, Trash2 } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
@@ -125,6 +125,12 @@ const UserProfileSelector = ({ profiles, selectedUserId, onSelect }) => {
 
 const SESSION_KEY = 'openshorts_session';
 const SESSION_MAX_AGE = 3600000; // 1 hour (matches server job retention)
+const CLIP_PROJECT_KEY = 'openshorts_clip_project_id';
+
+const createProjectId = () => {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `project-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+};
 
 // Mock polling function
 const pollJob = async (jobId) => {
@@ -158,6 +164,7 @@ function App() {
   const [uploadUserId, setUploadUserId] = useState(() => localStorage.getItem('uploadUserId') || '');
   const [userProfiles, setUserProfiles] = useState([]); // List of {username, connected: []}
   const [showKeyModal, setShowKeyModal] = useState(false);
+  const [currentProjectId, setCurrentProjectId] = useState(() => localStorage.getItem(CLIP_PROJECT_KEY) || createProjectId());
   const [jobId, setJobId] = useState(null);
   const [status, setStatus] = useState('idle'); // idle, processing, complete, error
   const [results, setResults] = useState(null);
@@ -165,6 +172,52 @@ function App() {
   const [logsVisible, setLogsVisible] = useState(true);
   const [processingMedia, setProcessingMedia] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
+
+  // Durable job history (server-side). This prevents previous generations from "disappearing"
+  // when the user starts a new job or refreshes the page.
+  const [jobList, setJobList] = useState([]);
+  const [jobListLoading, setJobListLoading] = useState(false);
+  const [jobListError, setJobListError] = useState(null);
+
+  const refreshJobList = async () => {
+    setJobListLoading(true);
+    setJobListError(null);
+    try {
+      const res = await fetch(getApiUrl('/api/jobs?limit=100'));
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setJobList(data.jobs || []);
+    } catch (e) {
+      setJobListError(e.message || 'Failed to load jobs');
+    } finally {
+      setJobListLoading(false);
+    }
+  };
+
+  const mapBackendStatusToUi = (s) => {
+    if (s === 'completed') return 'complete';
+    if (s === 'failed') return 'error';
+    if (s === 'queued' || s === 'processing') return 'processing';
+    return 'idle';
+  };
+
+  const openJob = async (id) => {
+    setJobId(id);
+    setResults(null);
+    setLogs([]);
+    setProcessingMedia(null);
+    setStatus('processing');
+    setActiveTab('dashboard');
+    try {
+      const data = await pollJob(id);
+      if (data.result) setResults(data.result);
+      if (data.logs) setLogs(data.logs);
+      setStatus(mapBackendStatusToUi(data.status));
+    } catch (e) {
+      setStatus('error');
+      setLogs([`Error loading job: ${e.message}`]);
+    }
+  };
 
   const [sessionRecovered, setSessionRecovered] = useState(false);
   const [showScheduleWeek, setShowScheduleWeek] = useState(false);
@@ -229,6 +282,18 @@ function App() {
       // localStorage full or serialization error - ignore
     }
   }, [jobId, status, results, activeTab]);
+
+  // Refresh server-side job list when opening History, and keep it updated while visible.
+  useEffect(() => {
+    if (activeTab !== 'history') return;
+    refreshJobList();
+    const t = setInterval(refreshJobList, 4000);
+    return () => clearInterval(t);
+  }, [activeTab]);
+
+  useEffect(() => {
+    localStorage.setItem(CLIP_PROJECT_KEY, currentProjectId);
+  }, [currentProjectId]);
 
   useEffect(() => {
     // Encrypt Gemini Key too for consistency if desired, but user asked specifically about Social integration not saving well.
@@ -333,13 +398,16 @@ function App() {
     try {
       let body;
       const headers = { 'X-Gemini-Key': apiKey };
+      const options = data.options || {};
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
-        body = JSON.stringify({ url: data.payload });
+        body = JSON.stringify({ url: data.payload, options, project_id: currentProjectId });
       } else {
         const formData = new FormData();
         formData.append('file', data.payload);
+        formData.append('options_json', JSON.stringify(options));
+        formData.append('project_id', currentProjectId);
         body = formData;
       }
 
@@ -366,6 +434,49 @@ function App() {
     setLogs([]);
     setProcessingMedia(null);
     localStorage.removeItem(SESSION_KEY);
+    const nextProjectId = createProjectId();
+    setCurrentProjectId(nextProjectId);
+    localStorage.setItem(CLIP_PROJECT_KEY, nextProjectId);
+  };
+
+  const historyGroups = jobList.reduce((acc, job) => {
+    const key = job.project_id || `job:${job.job_id}`;
+    const label = job.project_id || null;
+    let group = acc.find((item) => item.key === key);
+    if (!group) {
+      group = { key, projectId: label, jobs: [] };
+      acc.push(group);
+    }
+    group.jobs.push(job);
+    return acc;
+  }, []);
+
+  const handleDeleteJob = async (targetJobId) => {
+    if (!window.confirm('Delete this job and all related files? This also kills it if still running.')) return;
+    try {
+      const res = await fetch(getApiUrl(`/api/jobs/${targetJobId}`), { method: 'DELETE' });
+      if (!res.ok) throw new Error(await res.text());
+      if (jobId === targetJobId) {
+        handleReset();
+      }
+      await refreshJobList();
+    } catch (e) {
+      alert(`Delete job failed: ${e.message}`);
+    }
+  };
+
+  const handleDeleteProject = async (targetProjectId) => {
+    if (!window.confirm('Delete this entire project and all related files? Active jobs will be killed.')) return;
+    try {
+      const res = await fetch(getApiUrl(`/api/projects/${targetProjectId}`), { method: 'DELETE' });
+      if (!res.ok) throw new Error(await res.text());
+      if (currentProjectId === targetProjectId || (jobList.find(j => j.job_id === jobId)?.project_id === targetProjectId)) {
+        handleReset();
+      }
+      await refreshJobList();
+    } catch (e) {
+      alert(`Delete project failed: ${e.message}`);
+    }
   };
 
   // --- UI Components ---
@@ -410,6 +521,14 @@ function App() {
         >
           <Image size={20} />
           <span className="font-medium hidden lg:block">YouTube Studio</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('history')}
+          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'history' ? 'bg-white/5 text-white' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
+        >
+          <History size={20} />
+          <span className="font-medium hidden lg:block">History</span>
         </button>
 
         {/* <button
@@ -695,6 +814,107 @@ function App() {
           {/* View: Thumbnails */}
           {activeTab === 'thumbnails' && (
             <ThumbnailStudio geminiApiKey={apiKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} />
+          )}
+
+          {/* View: History */}
+          {activeTab === 'history' && (
+            <div className="h-full p-6 overflow-y-auto custom-scrollbar animate-[fadeIn_0.3s_ease-out]">
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-xl font-semibold text-white flex items-center gap-2">
+                  <History size={18} className="text-zinc-300" />
+                  Job History
+                </h2>
+                <button
+                  onClick={refreshJobList}
+                  className="text-sm text-zinc-400 hover:text-white transition-colors"
+                >
+                  Refresh
+                </button>
+              </div>
+
+              {jobListError && (
+                <div className="mb-4 p-3 rounded-xl border border-red-500/20 bg-red-500/10 text-red-300 text-sm">
+                  {jobListError}
+                </div>
+              )}
+
+              <div className="space-y-4">
+                {jobListLoading && jobList.length === 0 && (
+                  <div className="text-sm text-zinc-500">Loading…</div>
+                )}
+
+                {!jobListLoading && jobList.length === 0 && (
+                  <div className="text-sm text-zinc-500">No jobs yet.</div>
+                )}
+
+                {historyGroups.map((group) => (
+                  <div key={group.key} className="rounded-2xl border border-white/10 bg-white/5 overflow-hidden">
+                    <div className="flex items-center justify-between gap-4 px-4 py-3 border-b border-white/5 bg-white/5">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-white">
+                          {group.projectId ? `Project ${group.projectId.slice(0, 8)}` : 'Legacy Job'}
+                        </div>
+                        <div className="text-xs text-zinc-500">
+                          {group.jobs.length} job{group.jobs.length > 1 ? 's' : ''}
+                        </div>
+                      </div>
+                      {group.projectId && (
+                        <button
+                          onClick={() => handleDeleteProject(group.projectId)}
+                          className="inline-flex items-center gap-2 text-xs text-red-300 hover:text-red-200 transition-colors"
+                        >
+                          <Trash2 size={14} />
+                          Delete Project
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="space-y-2 p-3">
+                      {group.jobs.map((j) => {
+                        const input = j.input || {};
+                        const title = input.url || input.filename || j.job_id;
+                        const created = j.created_at ? new Date(j.created_at).toLocaleString() : '';
+                        const badge =
+                          j.status === 'completed' ? 'bg-green-500/10 border-green-500/20 text-green-400' :
+                            j.status === 'failed' ? 'bg-red-500/10 border-red-500/20 text-red-400' :
+                              'bg-primary/10 border-primary/20 text-primary';
+
+                        return (
+                          <button
+                            key={j.job_id}
+                            onClick={() => openJob(j.job_id)}
+                            className="w-full text-left p-4 rounded-xl border border-white/10 bg-black/20 hover:bg-white/10 transition-colors"
+                          >
+                            <div className="flex items-start justify-between gap-4">
+                              <div className="min-w-0">
+                                <div className="text-sm font-medium text-white truncate">{title}</div>
+                                <div className="text-xs text-zinc-500 mt-1 truncate">{j.job_id}</div>
+                                {created && <div className="text-xs text-zinc-600 mt-1">{created}</div>}
+                              </div>
+                              <div className="flex items-center gap-3 shrink-0">
+                                <div className={`text-[11px] px-2 py-1 rounded-full border ${badge}`}>
+                                  {j.status}
+                                </div>
+                                <span
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDeleteJob(j.job_id);
+                                  }}
+                                  className="inline-flex items-center gap-1 text-xs text-red-300 hover:text-red-200 transition-colors"
+                                >
+                                  <Trash2 size={14} />
+                                  Delete
+                                </span>
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
           )}
 
           {/* View: Gallery */}

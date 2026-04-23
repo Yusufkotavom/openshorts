@@ -12,6 +12,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
     const videoRef = React.useRef(null);
     const originalVideoUrl = getApiUrl(clip.video_url); // Never changes — used for Remotion previews
     const [currentVideoUrl, setCurrentVideoUrl] = useState(originalVideoUrl);
+    const [lastServerVideoUrl, setLastServerVideoUrl] = useState(originalVideoUrl);
 
     const [platforms, setPlatforms] = useState({
         tiktok: true,
@@ -38,6 +39,35 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
     // Accumulate Remotion layers across operations
     const [activeLayers, setActiveLayers] = useState({ subtitles: null, hook: null, effects: null });
+
+    // Load saved Remotion layers (if any) so History/editing doesn't lose them.
+    useEffect(() => {
+        if (!jobId || index === undefined) return;
+        fetch(getApiUrl(`/api/clip/${jobId}/${index}/layers`))
+            .then((res) => (res.ok ? res.json() : null))
+            .then((data) => {
+                if (data && data.layers && typeof data.layers === 'object') {
+                    setActiveLayers((prev) => ({ ...prev, ...data.layers }));
+                }
+            })
+            .catch(() => {});
+    }, [jobId, index]);
+
+    // Track last non-blob URL so server-side edits always receive a real filename.
+    useEffect(() => {
+        if (currentVideoUrl && !currentVideoUrl.startsWith('blob:')) {
+            setLastServerVideoUrl(currentVideoUrl);
+        }
+    }, [currentVideoUrl]);
+
+    const getServerInputFilename = () => {
+        const url = lastServerVideoUrl || originalVideoUrl;
+        try {
+            return url.split('/').pop();
+        } catch (e) {
+            return null;
+        }
+    };
 
     // Fetch clip duration from transcript endpoint
     useEffect(() => {
@@ -81,7 +111,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 body: JSON.stringify({
                     job_id: jobId,
                     clip_index: index,
-                    input_filename: currentVideoUrl.split('/').pop()
+                    input_filename: getServerInputFilename()
                 })
             });
 
@@ -104,7 +134,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 body: JSON.stringify({
                     job_id: jobId,
                     clip_index: index,
-                    input_filename: currentVideoUrl.split('/').pop()
+                    input_filename: getServerInputFilename()
                 })
             });
 
@@ -139,20 +169,51 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
         setEditError(null);
         try {
             if (options.remotion) {
-                // Accumulate layer and render all layers together
-                const newLayers = { ...activeLayers, subtitles: options.remotion };
-                setActiveLayers(newLayers);
-                const blobUrl = await renderInBrowser({
-                    videoUrl: originalVideoUrl,
-                    durationInSeconds: clipDuration,
-                    subtitles: newLayers.subtitles,
-                    hook: newLayers.hook,
-                    effects: newLayers.effects,
-                });
-                setCurrentVideoUrl(blobUrl);
-                if (videoRef.current) videoRef.current.load();
-                setShowSubtitleModal(false);
-                return;
+                try {
+                    // Accumulate layer and render all layers together
+                    const newLayers = { ...activeLayers, subtitles: options.remotion };
+                    setActiveLayers(newLayers);
+                    const blobUrl = await renderInBrowser({
+                        videoUrl: originalVideoUrl,
+                        durationInSeconds: clipDuration,
+                        subtitles: newLayers.subtitles,
+                        hook: newLayers.hook,
+                        effects: newLayers.effects,
+                    });
+                    // Optionally persist this render into the job folder so it survives reload/history.
+                    if (options.persistToProject) {
+                        const blob = await (await fetch(blobUrl)).blob();
+                        const form = new FormData();
+                        form.append('file', blob, `subtitles_${jobId}_${index}.mp4`);
+                        form.append('kind', 'remotion_subtitles');
+                        form.append('layers_json', JSON.stringify(newLayers));
+
+                        const saveRes = await fetch(getApiUrl(`/api/clip/${jobId}/${index}/save-render`), {
+                            method: 'POST',
+                            body: form,
+                        });
+
+                        if (!saveRes.ok) {
+                            const errText = await saveRes.text();
+                            throw new Error(errText || 'Failed to persist render');
+                        }
+                        const saved = await saveRes.json();
+                        if (saved && saved.new_video_url) {
+                            URL.revokeObjectURL(blobUrl);
+                            setCurrentVideoUrl(getApiUrl(saved.new_video_url));
+                        } else {
+                            setCurrentVideoUrl(blobUrl);
+                        }
+                    } else {
+                        setCurrentVideoUrl(blobUrl);
+                    }
+                    if (videoRef.current) videoRef.current.load();
+                    setShowSubtitleModal(false);
+                    return;
+                } catch (e) {
+                    // If browser-side render fails (WebCodecs/CORS/etc), fall back to server-side burn.
+                    console.error('[Remotion render] subtitle failed, falling back to /api/subtitle', e);
+                }
             }
 
             // Fallback: legacy FFmpeg
@@ -170,7 +231,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     border_width: options.borderWidth,
                     bg_color: options.bgColor,
                     bg_opacity: options.bgOpacity,
-                    input_filename: currentVideoUrl.split('/').pop()
+                    input_filename: getServerInputFilename()
                 })
             });
 
@@ -194,20 +255,49 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
         setEditError(null);
         try {
             if (hookData.remotion) {
-                // Accumulate layer and render all layers together
-                const newLayers = { ...activeLayers, hook: hookData.remotion };
-                setActiveLayers(newLayers);
-                const blobUrl = await renderInBrowser({
-                    videoUrl: originalVideoUrl,
-                    durationInSeconds: clipDuration,
-                    subtitles: newLayers.subtitles,
-                    hook: newLayers.hook,
-                    effects: newLayers.effects,
-                });
-                setCurrentVideoUrl(blobUrl);
-                if (videoRef.current) videoRef.current.load();
-                setShowHookModal(false);
-                return;
+                try {
+                    // Accumulate layer and render all layers together
+                    const newLayers = { ...activeLayers, hook: hookData.remotion };
+                    setActiveLayers(newLayers);
+                    const blobUrl = await renderInBrowser({
+                        videoUrl: originalVideoUrl,
+                        durationInSeconds: clipDuration,
+                        subtitles: newLayers.subtitles,
+                        hook: newLayers.hook,
+                        effects: newLayers.effects,
+                    });
+                    if (hookData.persistToProject) {
+                        const blob = await (await fetch(blobUrl)).blob();
+                        const form = new FormData();
+                        form.append('file', blob, `hook_${jobId}_${index}.mp4`);
+                        form.append('kind', 'remotion_hook');
+                        form.append('layers_json', JSON.stringify(newLayers));
+
+                        const saveRes = await fetch(getApiUrl(`/api/clip/${jobId}/${index}/save-render`), {
+                            method: 'POST',
+                            body: form,
+                        });
+
+                        if (!saveRes.ok) {
+                            const errText = await saveRes.text();
+                            throw new Error(errText || 'Failed to persist render');
+                        }
+                        const saved = await saveRes.json();
+                        if (saved && saved.new_video_url) {
+                            URL.revokeObjectURL(blobUrl);
+                            setCurrentVideoUrl(getApiUrl(saved.new_video_url));
+                        } else {
+                            setCurrentVideoUrl(blobUrl);
+                        }
+                    } else {
+                        setCurrentVideoUrl(blobUrl);
+                    }
+                    if (videoRef.current) videoRef.current.load();
+                    setShowHookModal(false);
+                    return;
+                } catch (e) {
+                    console.error('[Remotion render] hook failed, falling back to /api/hook', e);
+                }
             }
 
             // Fallback: legacy FFmpeg
@@ -224,7 +314,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     text: payload.text,
                     position: payload.position,
                     size: payload.size,
-                    input_filename: currentVideoUrl.split('/').pop()
+                    input_filename: getServerInputFilename()
                 })
             });
 
@@ -259,7 +349,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 job_id: jobId,
                 clip_index: index,
                 target_language: options.targetLanguage,
-                input_filename: currentVideoUrl.split('/').pop()
+                input_filename: getServerInputFilename()
             };
             console.log('[Translate] Request body:', requestBody);
             console.log('[Translate] Sending request to /api/translate');

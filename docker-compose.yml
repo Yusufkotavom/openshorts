@@ -3,11 +3,11 @@ services:
     build: .
     container_name: openshorts-backend
     ports:
-      - "8000:8000"
+      - "18000:8000"
     volumes:
-      - .:/app
-      - /app/__pycache__
-      - ./output:/app/output
+      - ./cookies.txt:/app/cookies.txt:ro
+      - openshorts_uploads:/app/uploads
+      - openshorts_output:/app/output
     restart: unless-stopped
 
   frontend:
@@ -30,7 +30,7 @@ services:
     ports:
       - "3100:3100"
     volumes:
-      - ./output:/output
+      - openshorts_output:/output
     environment:
       - REMOTION_BUNDLE_PATH=/app/remotion
       - OUTPUT_DIR=/output
@@ -38,3 +38,7 @@ services:
     restart: unless-stopped
     depends_on:
       - backend
+
+volumes:
+  openshorts_output:
+  openshorts_uploads:
