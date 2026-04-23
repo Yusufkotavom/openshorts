@@ -29,18 +29,27 @@ load_dotenv()
 ASPECT_RATIO = 9 / 16
 
 GEMINI_PROMPT_TEMPLATE = """
-You are a senior short-form video editor. Read the ENTIRE transcript and word-level timestamps to choose the 3–15 MOST VIRAL moments for TikTok/IG Reels/YouTube Shorts. Each clip must be between 15 and 60 seconds long.
+You are a senior short-form video editor. Read the ENTIRE transcript and word-level timestamps to choose viral moments for TikTok/IG Reels/YouTube Shorts.
 
 ⚠️ FFMPEG TIME CONTRACT — STRICT REQUIREMENTS:
 - Return timestamps in ABSOLUTE SECONDS from the start of the video (usable in: ffmpeg -ss <start> -to <end> -i <input> ...).
 - Only NUMBERS with decimal point, up to 3 decimals (examples: 0, 1.250, 17.350).
 - Ensure 0 ≤ start < end ≤ VIDEO_DURATION_SECONDS.
-- Each clip between 15 and 60 s (inclusive).
+- Each clip between MIN_CLIP_DURATION_SECONDS and MAX_CLIP_DURATION_SECONDS (inclusive).
 - Prefer starting 0.2–0.4 s BEFORE the hook and ending 0.2–0.4 s AFTER the payoff.
 - Use silence moments for natural cuts; never cut in the middle of a word or phrase.
 - STRICTLY FORBIDDEN to use time formats other than absolute seconds.
 
 VIDEO_DURATION_SECONDS: {video_duration}
+TARGET_CLIPS: {target_clips}
+MIN_CLIPS: {min_clips}
+MAX_CLIPS: {max_clips}
+MIN_CLIP_DURATION_SECONDS: {min_duration}
+MAX_CLIP_DURATION_SECONDS: {max_duration}
+CLIP_STRATEGY: {clip_strategy}
+ALLOW_CLIP_OVERLAP: {allow_clip_overlap}
+STRATEGY_GUIDANCE:
+{strategy_guidance}
 
 TRANSCRIPT_TEXT (raw):
 {transcript_text}
@@ -50,7 +59,7 @@ WORDS_JSON (array of {{w, s, e}} where s/e are seconds):
 
 STRICT EXCLUSIONS:
 - No generic intros/outros or purely sponsorship segments unless they contain the hook.
-- No clips < 15 s or > 60 s.
+- No clips shorter than MIN_CLIP_DURATION_SECONDS or longer than MAX_CLIP_DURATION_SECONDS.
 
 OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by predicted performance (best to worst). In the descriptions, ALWAYS include a CTA like "Follow me and comment X and I'll send you the workflow" (especially if discussing an n8n workflow):
 {{
@@ -811,7 +820,93 @@ def transcribe_video(video_path):
         'language': info.language
     }
 
-def get_viral_clips(transcript_result, video_duration):
+def build_clip_analysis_config(args):
+    min_clips = max(1, int(args.min_clips))
+    max_clips = max(1, int(args.max_clips))
+    if min_clips > max_clips:
+        min_clips, max_clips = max_clips, min_clips
+
+    target_clips = max(min_clips, min(max_clips, int(args.target_clips)))
+
+    min_duration = max(5, int(args.min_duration))
+    max_duration = max(5, int(args.max_duration))
+    if min_duration > max_duration:
+        min_duration, max_duration = max_duration, min_duration
+
+    clip_strategy = str(args.clip_strategy or "balanced").strip().lower()
+    if clip_strategy not in ("balanced", "quantity", "viral_only"):
+        clip_strategy = "balanced"
+
+    return {
+        "target_clips": target_clips,
+        "min_clips": min_clips,
+        "max_clips": max_clips,
+        "min_duration": min_duration,
+        "max_duration": max_duration,
+        "clip_strategy": clip_strategy,
+        "allow_clip_overlap": bool(args.allow_clip_overlap),
+    }
+
+
+def get_strategy_guidance(config):
+    strategy = config["clip_strategy"]
+    if strategy == "quantity":
+        return (
+            f"Favor coverage and volume. Aim close to {config['target_clips']} clips. "
+            f"If the video is long, include strong tier-2 moments too, not only the absolute top highlights."
+        )
+    if strategy == "viral_only":
+        return (
+            "Be highly selective. Only keep the strongest, highest-retention moments. "
+            f"You must still return at least {config['min_clips']} clips if the material supports it."
+        )
+    return (
+        f"Balance quality and quantity. Aim close to {config['target_clips']} clips while keeping each moment clearly compelling."
+    )
+
+
+def validate_and_normalize_clips(clips_data, video_duration, config):
+    if not isinstance(clips_data, dict) or "shorts" not in clips_data:
+        return None
+
+    normalized = []
+    last_end = -1.0
+    min_duration = float(config["min_duration"])
+    max_duration = float(config["max_duration"])
+    allow_overlap = config["allow_clip_overlap"]
+
+    for clip in clips_data.get("shorts", []):
+        try:
+            start = round(float(clip["start"]), 3)
+            end = round(float(clip["end"]), 3)
+        except Exception:
+            continue
+
+        if start < 0 or end <= start or end > video_duration:
+            continue
+
+        duration = end - start
+        if duration < min_duration or duration > max_duration:
+            continue
+
+        if not allow_overlap and start < last_end:
+            continue
+
+        normalized_clip = dict(clip)
+        normalized_clip["start"] = start
+        normalized_clip["end"] = end
+        normalized.append(normalized_clip)
+        last_end = end
+
+    normalized.sort(key=lambda item: item["start"])
+    normalized = normalized[: config["max_clips"]]
+
+    result = dict(clips_data)
+    result["shorts"] = normalized
+    return result
+
+
+def get_viral_clips(transcript_result, video_duration, config):
     print("🤖  Analyzing with Gemini...")
     
     api_key = os.getenv("GEMINI_API_KEY")
@@ -839,66 +934,88 @@ def get_viral_clips(transcript_result, video_duration):
 
     prompt = GEMINI_PROMPT_TEMPLATE.format(
         video_duration=video_duration,
+        target_clips=config["target_clips"],
+        min_clips=config["min_clips"],
+        max_clips=config["max_clips"],
+        min_duration=config["min_duration"],
+        max_duration=config["max_duration"],
+        clip_strategy=config["clip_strategy"],
+        allow_clip_overlap="yes" if config["allow_clip_overlap"] else "no",
+        strategy_guidance=get_strategy_guidance(config),
         transcript_text=json.dumps(transcript_result['text']),
         words_json=json.dumps(words)
     )
 
+    attempt_notes = [
+        "",
+        (
+            f"\n\nRETRY INSTRUCTION: Your previous answer did not satisfy the requested clip count. "
+            f"Return at least {config['min_clips']} clips and aim for {config['target_clips']} clips. "
+            "Expand into additional strong moments from the transcript while keeping timestamp quality high."
+        ),
+        (
+            f"\n\nFINAL RETRY INSTRUCTION: The video is long enough to support more clips. "
+            f"Return between {config['min_clips']} and {config['max_clips']} clips. "
+            "Include secondary but still engaging moments if needed."
+        ),
+    ]
+
     try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt
-        )
+        cost_analysis = None
+        for attempt_index, attempt_note in enumerate(attempt_notes, start=1):
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt + attempt_note
+            )
         
-        # --- Cost Calculation ---
-        try:
-            usage = response.usage_metadata
-            if usage:
-                # Gemini 2.5 Flash Pricing (Dec 2025)
-                # Input: $0.10 per 1M tokens
-                # Output: $0.40 per 1M tokens
-                
-                input_price_per_million = 0.10
-                output_price_per_million = 0.40
-                
-                prompt_tokens = usage.prompt_token_count
-                output_tokens = usage.candidates_token_count
-                
-                input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
-                output_cost = (output_tokens / 1_000_000) * output_price_per_million
-                total_cost = input_cost + output_cost
-                
-                cost_analysis = {
-                    "input_tokens": prompt_tokens,
-                    "output_tokens": output_tokens,
-                    "input_cost": input_cost,
-                    "output_cost": output_cost,
-                    "total_cost": total_cost,
-                    "model": model_name
-                }
+            # --- Cost Calculation ---
+            try:
+                usage = response.usage_metadata
+                if usage:
+                    input_price_per_million = 0.10
+                    output_price_per_million = 0.40
 
-                print(f"💰 Token Usage ({model_name}):")
-                print(f"   - Input Tokens: {prompt_tokens} (${input_cost:.6f})")
-                print(f"   - Output Tokens: {output_tokens} (${output_cost:.6f})")
-                print(f"   - Total Estimated Cost: ${total_cost:.6f}")
-                
-        except Exception as e:
-            print(f"⚠️ Could not calculate cost: {e}")
-            cost_analysis = None
-        # ------------------------
+                    prompt_tokens = usage.prompt_token_count
+                    output_tokens = usage.candidates_token_count
 
-        # Clean response if it contains markdown code blocks
-        text = response.text
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-        
-        result_json = json.loads(text)
-        if cost_analysis:
-            result_json['cost_analysis'] = cost_analysis
-            
-        return result_json
+                    input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
+                    output_cost = (output_tokens / 1_000_000) * output_price_per_million
+                    total_cost = input_cost + output_cost
+
+                    cost_analysis = {
+                        "input_tokens": prompt_tokens,
+                        "output_tokens": output_tokens,
+                        "input_cost": input_cost,
+                        "output_cost": output_cost,
+                        "total_cost": total_cost,
+                        "model": model_name,
+                        "attempts": attempt_index,
+                    }
+            except Exception as e:
+                print(f"⚠️ Could not calculate cost: {e}")
+
+            text = response.text
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+
+            result_json = json.loads(text)
+            validated = validate_and_normalize_clips(result_json, video_duration, config)
+            if not validated:
+                continue
+
+            clip_count = len(validated.get("shorts", []))
+            if clip_count < config["min_clips"] and attempt_index < len(attempt_notes):
+                print(f"⚠️ Gemini returned only {clip_count} clips, retrying...")
+                continue
+
+            if cost_analysis:
+                validated["cost_analysis"] = cost_analysis
+            return validated
+
+        return None
     except Exception as e:
         print(f"❌ Gemini Error: {e}")
         return None
@@ -913,6 +1030,13 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', type=str, help="Output directory or file (if processing whole video).")
     parser.add_argument('--keep-original', action='store_true', help="Keep the downloaded YouTube video.")
     parser.add_argument('--skip-analysis', action='store_true', help="Skip AI analysis and convert the whole video.")
+    parser.add_argument('--target-clips', type=int, default=10, help="Preferred number of clips to generate.")
+    parser.add_argument('--min-clips', type=int, default=6, help="Minimum number of clips to generate.")
+    parser.add_argument('--max-clips', type=int, default=15, help="Maximum number of clips to generate.")
+    parser.add_argument('--min-duration', type=int, default=20, help="Minimum duration per clip in seconds.")
+    parser.add_argument('--max-duration', type=int, default=45, help="Maximum duration per clip in seconds.")
+    parser.add_argument('--clip-strategy', type=str, default="balanced", help="balanced, quantity, or viral_only.")
+    parser.add_argument('--allow-clip-overlap', action='store_true', help="Allow overlapping clip ranges.")
     
     args = parser.parse_args()
 
@@ -968,6 +1092,7 @@ if __name__ == '__main__':
     else:
         # 3. Transcribe
         transcript = transcribe_video(input_video)
+        analysis_config = build_clip_analysis_config(args)
         
         # Get duration
         cap = cv2.VideoCapture(input_video)
@@ -977,7 +1102,7 @@ if __name__ == '__main__':
         cap.release()
 
         # 4. Gemini Analysis
-        clips_data = get_viral_clips(transcript, duration)
+        clips_data = get_viral_clips(transcript, duration, analysis_config)
         
         if not clips_data or 'shorts' not in clips_data:
             print("❌ Failed to identify clips. Converting whole video as fallback.")
@@ -988,6 +1113,7 @@ if __name__ == '__main__':
             
             # Save metadata
             clips_data['transcript'] = transcript # Save full transcript for subtitles
+            clips_data['analysis_config'] = analysis_config
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
             with open(metadata_file, 'w') as f:
                 json.dump(clips_data, f, indent=2)

@@ -30,7 +30,7 @@ function StepIndicator({ currentStep }) {
   );
 }
 
-function DragDropZone({ label, accept, onFile, file, onClear, icon: Icon }) {
+function DragDropZone({ label, accept, onFile, file, onClear, icon }) {
   const [isDragging, setIsDragging] = useState(false);
   const inputRef = useRef(null);
 
@@ -54,7 +54,7 @@ function DragDropZone({ label, accept, onFile, file, onClear, icon: Icon }) {
             <img src={URL.createObjectURL(file)} className="w-12 h-12 rounded-lg object-cover" alt="" />
           ) : (
             <div className="w-12 h-12 rounded-lg bg-white/10 flex items-center justify-center">
-              <Icon size={20} className="text-zinc-400" />
+              {React.createElement(icon, { size: 20, className: 'text-zinc-400' })}
             </div>
           )}
           <div className="flex-1 min-w-0">
@@ -78,7 +78,7 @@ function DragDropZone({ label, accept, onFile, file, onClear, icon: Icon }) {
       className={`border-2 border-dashed rounded-xl p-6 text-center cursor-pointer transition-all ${isDragging ? 'border-primary/50 bg-primary/5' : 'border-white/10 hover:border-white/20 bg-white/[0.02]'
         }`}
     >
-      <Icon size={24} className="mx-auto text-zinc-500 mb-2" />
+      {React.createElement(icon, { size: 24, className: 'mx-auto text-zinc-500 mb-2' })}
       <p className="text-sm text-zinc-400">{label}</p>
       <p className="text-xs text-zinc-600 mt-1">Drop or click to upload</p>
       <input

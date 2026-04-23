@@ -4,7 +4,6 @@ import { Download, Youtube, Instagram, Video, Copy, Check, Play } from 'lucide-r
 export default function GalleryCard({ clip }) {
     const [copied, setCopied] = useState(null);
     const [isVisible, setIsVisible] = useState(false);
-    const [hasLoaded, setHasLoaded] = useState(false);
     const cardRef = useRef(null);
     const videoRef = useRef(null);
 
@@ -26,13 +25,14 @@ export default function GalleryCard({ clip }) {
             }
         );
 
-        if (cardRef.current) {
-            observer.observe(cardRef.current);
+        const cardNode = cardRef.current;
+        if (cardNode) {
+            observer.observe(cardNode);
         }
 
         return () => {
-            if (cardRef.current) {
-                observer.unobserve(cardRef.current);
+            if (cardNode) {
+                observer.unobserve(cardNode);
             }
         };
     }, []);

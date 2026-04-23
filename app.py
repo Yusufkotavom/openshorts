@@ -361,6 +361,50 @@ class ProcessRequest(BaseModel):
     url: str
     options: Optional[dict] = None
 
+
+def _build_clip_analysis_args(options: Optional[dict]) -> List[str]:
+    opts = options or {}
+
+    def _safe_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(opts.get(name, default))
+        except Exception:
+            value = default
+        return max(minimum, min(maximum, value))
+
+    def _safe_bool(name: str, default: bool = False) -> bool:
+        value = opts.get(name, default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    target_clips = _safe_int("target_clips", 10, 1, 30)
+    min_clips = _safe_int("min_clips", 6, 1, 30)
+    max_clips = _safe_int("max_clips", 15, 1, 30)
+    min_duration = _safe_int("min_duration_seconds", 20, 5, 180)
+    max_duration = _safe_int("max_duration_seconds", 45, 5, 180)
+    clip_strategy = str(opts.get("clip_strategy", "balanced")).strip().lower()
+    if clip_strategy not in ("balanced", "quantity", "viral_only"):
+        clip_strategy = "balanced"
+
+    if min_clips > max_clips:
+        min_clips, max_clips = max_clips, min_clips
+    target_clips = max(min_clips, min(max_clips, target_clips))
+    if min_duration > max_duration:
+        min_duration, max_duration = max_duration, min_duration
+
+    args = [
+        "--target-clips", str(target_clips),
+        "--min-clips", str(min_clips),
+        "--max-clips", str(max_clips),
+        "--min-duration", str(min_duration),
+        "--max-duration", str(max_duration),
+        "--clip-strategy", clip_strategy,
+    ]
+    if _safe_bool("allow_clip_overlap", False):
+        args.append("--allow-clip-overlap")
+    return args
+
 def enqueue_output(out, job_id):
     """Reads output from a subprocess and appends it to jobs logs."""
     try:
@@ -707,6 +751,7 @@ async def process_endpoint(
         input_file = input_path
 
     cmd.extend(["-o", job_output_dir])
+    cmd.extend(_build_clip_analysis_args(options))
 
     _persist_job_meta(job_id, {"input_file": input_file})
 
@@ -1350,9 +1395,16 @@ async def add_subtitles(req: SubtitleRequest):
             success = await loop.run_in_executor(None, run_transcribe_srt)
         else:
             success = generate_srt(transcript, clip_data['start'], clip_data['end'], srt_path)
+            if not success:
+                print("⚠️ Transcript words not found in clip range, retrying with fresh clip transcription...")
+                def run_transcribe_srt():
+                    return generate_srt_from_video(input_path, srt_path)
+
+                loop = asyncio.get_event_loop()
+                success = await loop.run_in_executor(None, run_transcribe_srt)
 
         if not success:
-             raise HTTPException(status_code=400, detail="No words found for this clip range.")
+             raise HTTPException(status_code=400, detail="No subtitle words found for this clip range.")
 
         # 2. Burn Subtitles
         # Run in thread pool
@@ -1366,6 +1418,8 @@ async def add_subtitles(req: SubtitleRequest):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_burn)
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Subtitle Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

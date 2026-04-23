@@ -70,9 +70,6 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   const [actorGallery, setActorGallery] = useState([]);
   const [loadingGallery, setLoadingGallery] = useState(false);
   const [uploadedActorPreview, setUploadedActorPreview] = useState(null); // {localPreview, serverUrl}
-  const [productPhoto, setProductPhoto] = useState(null); // {preview, serverUrl}
-  const [productDescription, setProductDescription] = useState('');
-
   // Step 3: Generate
   const [generating, setGenerating] = useState(false);
   const [jobId, setJobId] = useState(null);
@@ -97,7 +94,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       setActorDescription(scripts[0].actor_description || '');
       setEditedNarration(scripts[0].full_narration || '');
     }
-  }, []);
+  }, [fromCache, scripts, actorDescription]);
 
   // Fetch actor gallery on mount
   useEffect(() => {
@@ -114,7 +111,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     if (elevenLabsKey) {
       fetchVoices();
     }
-  }, [elevenLabsKey]);
+  }, [elevenLabsKey, fetchVoices]);
 
   // Reset selected voice when actor gender changes
   useEffect(() => {
@@ -131,7 +128,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     } else {
       setSelectedVoice(genderDefaults[`${language}-${actorGender}`] || genderDefaults['en-female']);
     }
-  }, [actorGender, language]);
+  }, [actorGender, language, voices]);
 
   // Poll generation status
   useEffect(() => {

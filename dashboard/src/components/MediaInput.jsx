@@ -10,6 +10,13 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [autoSubtitle, setAutoSubtitle] = useState(false);
     const [autoHook, setAutoHook] = useState(false);
     const [hookText, setHookText] = useState('POV: kamu nemu clip paling lucu di video ini');
+    const [targetClips, setTargetClips] = useState(10);
+    const [minClips, setMinClips] = useState(6);
+    const [maxClips, setMaxClips] = useState(15);
+    const [minDurationSeconds, setMinDurationSeconds] = useState(20);
+    const [maxDurationSeconds, setMaxDurationSeconds] = useState(45);
+    const [clipStrategy, setClipStrategy] = useState('balanced');
+    const [allowClipOverlap, setAllowClipOverlap] = useState(false);
 
     const handleSubmit = (e) => {
         e.preventDefault();
@@ -17,6 +24,13 @@ export default function MediaInput({ onProcess, isProcessing }) {
             auto_subtitle: autoSubtitle,
             auto_hook: autoHook,
             hook_text: hookText,
+            target_clips: Number(targetClips),
+            min_clips: Number(minClips),
+            max_clips: Number(maxClips),
+            min_duration_seconds: Number(minDurationSeconds),
+            max_duration_seconds: Number(maxDurationSeconds),
+            clip_strategy: clipStrategy,
+            allow_clip_overlap: allowClipOverlap,
         };
         if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, options });
@@ -104,6 +118,95 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         )}
                     </div>
                 )}
+
+                <div className="mt-6 p-4 rounded-xl border border-white/10 bg-white/5">
+                    <div className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-3">Clip Settings</div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <label className="space-y-2">
+                            <div className="text-xs text-zinc-500">Target clips</div>
+                            <input
+                                type="number"
+                                min="1"
+                                max="30"
+                                value={targetClips}
+                                onChange={(e) => setTargetClips(e.target.value)}
+                                className="input-field"
+                            />
+                        </label>
+                        <label className="space-y-2">
+                            <div className="text-xs text-zinc-500">Minimum clips</div>
+                            <input
+                                type="number"
+                                min="1"
+                                max="30"
+                                value={minClips}
+                                onChange={(e) => setMinClips(e.target.value)}
+                                className="input-field"
+                            />
+                        </label>
+                        <label className="space-y-2">
+                            <div className="text-xs text-zinc-500">Maximum clips</div>
+                            <input
+                                type="number"
+                                min="1"
+                                max="30"
+                                value={maxClips}
+                                onChange={(e) => setMaxClips(e.target.value)}
+                                className="input-field"
+                            />
+                        </label>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                        <label className="space-y-2">
+                            <div className="text-xs text-zinc-500">Min duration (seconds)</div>
+                            <input
+                                type="number"
+                                min="5"
+                                max="180"
+                                value={minDurationSeconds}
+                                onChange={(e) => setMinDurationSeconds(e.target.value)}
+                                className="input-field"
+                            />
+                        </label>
+                        <label className="space-y-2">
+                            <div className="text-xs text-zinc-500">Max duration (seconds)</div>
+                            <input
+                                type="number"
+                                min="5"
+                                max="180"
+                                value={maxDurationSeconds}
+                                onChange={(e) => setMaxDurationSeconds(e.target.value)}
+                                className="input-field"
+                            />
+                        </label>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                        <label className="space-y-2">
+                            <div className="text-xs text-zinc-500">Selection strategy</div>
+                            <select
+                                value={clipStrategy}
+                                onChange={(e) => setClipStrategy(e.target.value)}
+                                className="input-field"
+                            >
+                                <option value="balanced">Balanced</option>
+                                <option value="quantity">Quantity</option>
+                                <option value="viral_only">Viral Only</option>
+                            </select>
+                        </label>
+                        <label className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-black/20 px-4 py-3 mt-6 md:mt-0">
+                            <span className="text-sm text-zinc-200">Allow overlapping clips</span>
+                            <input
+                                type="checkbox"
+                                checked={allowClipOverlap}
+                                onChange={(e) => setAllowClipOverlap(e.target.checked)}
+                                className="h-4 w-4 accent-primary"
+                            />
+                        </label>
+                    </div>
+                </div>
 
                 {/* Automation (Server-Side) */}
                 <div className="mt-6 p-4 rounded-xl border border-white/10 bg-white/5">

@@ -281,7 +281,7 @@ function App() {
     } catch (e) {
       // localStorage full or serialization error - ignore
     }
-  }, [jobId, status, results, activeTab]);
+  }, [jobId, status, results, activeTab, processingMedia]);
 
   // Refresh server-side job list when opening History, and keep it updated while visible.
   useEffect(() => {

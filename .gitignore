@@ -3,6 +3,8 @@
 *.webm
 *.mov
 *.mkv
+churchil_queen_vertical.gif
+churchil_queen_vertical_short.gif
 
 # YOLO model
 *.pt
@@ -39,4 +41,3 @@ output/
 .claude/
 skills/
 skills-lock.json
-
